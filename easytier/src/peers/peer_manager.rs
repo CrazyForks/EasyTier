@@ -71,7 +71,7 @@ struct RpcTransport {
     packet_recv: Mutex<UnboundedReceiver<ZCPacket>>,
     peer_rpc_tspt_sender: UnboundedSender<ZCPacket>,
 
-    encryptor: Arc<Box<dyn Encryptor>>,
+    encryptor: Arc<dyn Encryptor>,
 }
 
 #[async_trait::async_trait]
@@ -147,7 +147,7 @@ pub struct PeerManager {
     foreign_network_manager: Arc<ForeignNetworkManager>,
     foreign_network_client: Arc<ForeignNetworkClient>,
 
-    encryptor: Arc<Box<dyn Encryptor>>,
+    encryptor: Arc<dyn Encryptor + 'static>,
     data_compress_algo: CompressorAlgo,
 
     exit_nodes: Vec<IpAddr>,
@@ -184,25 +184,18 @@ impl PeerManager {
             my_peer_id,
         ));
 
-        let mut encryptor: Arc<Box<dyn Encryptor>> = Arc::new(Box::new(NullCipher));
-        if global_ctx.get_flags().enable_encryption {
-            #[cfg(feature = "wireguard")]
-            {
-                use super::encrypt::ring_aes_gcm::AesGcmCipher;
-                encryptor = Arc::new(Box::new(AesGcmCipher::new_128(global_ctx.get_128_key())));
-            }
-
-            #[cfg(all(feature = "aes-gcm", not(feature = "wireguard")))]
-            {
-                use super::encrypt::aes_gcm::AesGcmCipher;
-                encryptor = Arc::new(Box::new(AesGcmCipher::new_128(global_ctx.get_128_key())));
-            }
-
-            #[cfg(all(not(feature = "wireguard"), not(feature = "aes-gcm")))]
-            {
-                compile_error!("wireguard or aes-gcm feature must be enabled for encryption");
-            }
-        }
+        let encryptor = if global_ctx.get_flags().enable_encryption {
+            // 只有在启用加密时才使用工厂函数选择算法
+            let algorithm = &global_ctx.get_flags().encryption_algorithm;
+            super::encrypt::create_encryptor(
+                algorithm,
+                global_ctx.get_128_key(),
+                global_ctx.get_256_key(),
+            )
+        } else {
+            // disable_encryption = true 时使用 NullCipher
+            Arc::new(NullCipher)
+        };
 
         if global_ctx
             .check_network_in_whitelist(&global_ctx.get_network_name())
@@ -1110,7 +1103,7 @@ impl PeerManager {
 
     pub async fn try_compress_and_encrypt(
         compress_algo: CompressorAlgo,
-        encryptor: &Box<dyn Encryptor>,
+        encryptor: &Arc<dyn Encryptor + 'static>,
         msg: &mut ZCPacket,
     ) -> Result<(), Error> {
         let compressor = DefaultCompressor {};
@@ -1359,6 +1352,45 @@ impl PeerManager {
             .await;
         tracing::info!("close_peer_conn in foreign network manager done: {:?}", ret);
         ret
+    }
+
+    pub async fn check_allow_kcp_to_dst(&self, dst_ip: &IpAddr) -> bool {
+        let route = self.get_route();
+        let Some(dst_peer_id) = route.get_peer_id_by_ip(dst_ip).await else {
+            return false;
+        };
+        let Some(peer_info) = route.get_peer_info(dst_peer_id).await else {
+            return false;
+        };
+
+        // check dst allow kcp input
+        if !peer_info.feature_flag.map(|x| x.kcp_input).unwrap_or(false) {
+            return false;
+        }
+
+        let next_hop_policy = Self::get_next_hop_policy(self.global_ctx.get_flags().latency_first);
+        // check relay node allow relay kcp.
+        let Some(next_hop_id) = route
+            .get_next_hop_with_policy(dst_peer_id, next_hop_policy)
+            .await
+        else {
+            return false;
+        };
+
+        let Some(next_hop_info) = route.get_peer_info(next_hop_id).await else {
+            return false;
+        };
+
+        // check next hop allow kcp relay
+        if next_hop_info
+            .feature_flag
+            .map(|x| x.no_relay_kcp)
+            .unwrap_or(false)
+        {
+            return false;
+        }
+
+        true
     }
 }
 
